@@ -9,6 +9,193 @@ import scipy
 from scipy import signal
 import warnings
 
+ZOOM_WINDOW_S = 0.01
+ROSETTE_LABELS = ("B1", "B3", "B5", "B7")
+ACTIVE_GAUGE_INDEX = {"B1": 6, "B3": 8, "B5": 10, "B7": 12}
+GAUGE_COLOR_BY_INDEX = {6: "C0", 8: "C1", 10: "C3", 12: "C2"}
+
+
+def subtract_pre_event_baseline_1d(values, relative_time_s):
+    arr = np.asarray(values, dtype=np.float64).copy()
+    tt = np.asarray(relative_time_s, dtype=np.float64)
+    if arr.size != tt.size or arr.size == 0:
+        return arr
+    pre_event_mask = tt < 0.0
+    if np.any(pre_event_mask):
+        baseline = float(np.mean(arr[pre_event_mask]))
+    else:
+        baseline_width = max(1, min(arr.size, arr.size // 10 or 1))
+        baseline = float(np.mean(arr[:baseline_width]))
+    return arr - baseline
+
+
+def compute_accelerometer_displacement_um(event, relative_time_s):
+    """Estimate displacement from accelerometer data by double integration."""
+    acceleration = event.get("acceleration_m_per_s2")
+    if acceleration is None:
+        return np.full_like(relative_time_s, np.nan, dtype=np.float64)
+
+    tt = np.asarray(relative_time_s, dtype=np.float64)
+    acc = np.asarray(acceleration, dtype=np.float64)
+    if tt.size != acc.size or tt.size == 0:
+        return np.full_like(tt, np.nan, dtype=np.float64)
+
+    pre_event_mask = tt < 0.0
+    if np.any(pre_event_mask):
+        baseline = float(np.mean(acc[pre_event_mask]))
+    else:
+        baseline = float(np.mean(acc))
+    acc = acc - baseline
+
+    velocity = scipy.integrate.cumulative_trapezoid(acc, tt, initial=0.0)
+    if np.any(pre_event_mask):
+        velocity -= float(np.mean(velocity[pre_event_mask]))
+    else:
+        velocity -= velocity[0]
+
+    displacement_m = scipy.integrate.cumulative_trapezoid(velocity, tt, initial=0.0)
+    if np.any(pre_event_mask):
+        displacement_m -= float(np.mean(displacement_m[pre_event_mask]))
+    else:
+        displacement_m -= displacement_m[0]
+
+    return displacement_m * 1e6
+
+
+def compute_strain_ylim(locations, enabled_channels):
+    """Compute a tight y-limit around active strain-gauge locations."""
+    active_locations = [
+        float(locations[i]) for i, enabled in enumerate(enabled_channels) if enabled
+    ]
+    if not active_locations:
+        return 1.0, -1.0
+
+    ymin = min(active_locations)
+    ymax = max(active_locations)
+    if np.isclose(ymin, ymax):
+        padding = max(20.0, abs(ymin) * 0.1 + 10.0)
+    else:
+        padding = max(20.0, 0.15 * (ymax - ymin))
+    return ymax + padding, ymin - padding
+
+
+def compute_channel_spacing_mm(locations, enabled_channels):
+    """Estimate spacing between active gauges from their fault locations."""
+    active_locations = sorted(
+        {float(locations[i]) for i, enabled in enumerate(enabled_channels) if enabled}
+    )
+    if len(active_locations) < 2:
+        return 100.0
+
+    diffs = np.diff(active_locations)
+    positive_diffs = diffs[diffs > 0.0]
+    if positive_diffs.size == 0:
+        return 100.0
+    return float(np.min(positive_diffs))
+
+
+def remove_pre_event_baseline(signals, relative_time_s):
+    """Center each channel on its pre-event baseline for display."""
+    centered = np.asarray(signals, dtype=np.float64).copy()
+    tt = np.asarray(relative_time_s, dtype=np.float64)
+    if centered.ndim != 2 or tt.size != centered.shape[1]:
+        return centered
+
+    pre_event_mask = tt < 0.0
+    for i in range(centered.shape[0]):
+        channel = centered[i]
+        if np.any(pre_event_mask):
+            baseline = float(np.mean(channel[pre_event_mask]))
+        else:
+            baseline_width = max(1, min(channel.size, channel.size // 10 or 1))
+            baseline = float(np.mean(channel[:baseline_width]))
+        centered[i] = channel - baseline
+    return centered
+
+
+def fallback_plot_data(event):
+    event_time = float(event["event_time"])
+    rel_time = np.asarray(event["time"], dtype=np.float64) - event_time
+    tau_mpa = np.asarray(event["shear_stress"], dtype=np.float64)
+    mu = np.divide(
+        np.asarray(event["shear_stress"], dtype=np.float64),
+        np.asarray(event["normal_stress"], dtype=np.float64),
+        out=np.zeros_like(tau_mpa),
+        where=np.abs(np.asarray(event["normal_stress"], dtype=np.float64)) > 1e-12,
+    )
+    delta_lp_um = subtract_pre_event_baseline_1d(
+        np.asarray(event["LP_displacement"], dtype=np.float64) * 1e4,
+        rel_time,
+    )
+    delta_acc_um = compute_accelerometer_displacement_um(event, rel_time)
+
+    display_by_index = {}
+    if "on_fault_shear_stress_mpa" in event["strain"]:
+        strain_rel_time = np.asarray(event["strain"]["time"], dtype=np.float64) - event_time
+        for label in ROSETTE_LABELS:
+            if label in event["strain"]["on_fault_shear_stress_mpa"]:
+                display_by_index[ACTIVE_GAUGE_INDEX[label]] = subtract_pre_event_baseline_1d(
+                    np.asarray(event["strain"]["on_fault_shear_stress_mpa"][label], dtype=np.float64),
+                    strain_rel_time,
+                )
+        lower_rel_time = strain_rel_time
+    else:
+        lower_rel_time = np.asarray(event["strain"]["original"]["time"], dtype=np.float64) - event_time
+        raw = remove_pre_event_baseline(event["strain"]["original"]["raw"], lower_rel_time)
+        for label, gauge_idx in ACTIVE_GAUGE_INDEX.items():
+            if gauge_idx < raw.shape[0]:
+                display_by_index[gauge_idx] = raw[gauge_idx]
+
+    return {
+        "top_rel_time": rel_time,
+        "tau_mpa": tau_mpa,
+        "mu": mu,
+        "delta_lp_um": delta_lp_um,
+        "delta_acc_um": delta_acc_um,
+        "lower_rel_time": lower_rel_time,
+        "lower_abs_time": lower_rel_time + event_time,
+        "lower_by_index": display_by_index,
+        "window_half_width_s": float(np.max(np.abs(lower_rel_time))) if lower_rel_time.size else ZOOM_WINDOW_S,
+    }
+
+
+def load_zoom_plot_data(event):
+    if "pick_arrivals" not in event:
+        return fallback_plot_data(event)
+
+    pick_arrivals = event["pick_arrivals"]
+    colors_by_label = pick_arrivals.get("colors_by_label", {})
+    for label, gauge_idx in ACTIVE_GAUGE_INDEX.items():
+        if label in colors_by_label:
+            GAUGE_COLOR_BY_INDEX[gauge_idx] = colors_by_label[label]
+
+    return {
+        "top_rel_time": np.asarray(pick_arrivals["relative_time_s"], dtype=np.float64),
+        "tau_mpa": np.asarray(pick_arrivals["tau_mpa"], dtype=np.float64),
+        "mu": np.asarray(pick_arrivals["mu"], dtype=np.float64),
+        "delta_lp_um": np.asarray(pick_arrivals["delta_lp_um"], dtype=np.float64),
+        "delta_acc_um": np.asarray(pick_arrivals["delta_um"], dtype=np.float64),
+        "lower_rel_time": np.asarray(pick_arrivals["relative_time_s"], dtype=np.float64),
+        "lower_abs_time": np.asarray(pick_arrivals["time"], dtype=np.float64),
+        "lower_by_index": {
+            ACTIVE_GAUGE_INDEX[label]: np.asarray(values, dtype=np.float64)
+            for label, values in pick_arrivals["delta_tau_mpa_by_label"].items()
+            if label in ACTIVE_GAUGE_INDEX
+        },
+        "default_picked_idx_by_index": {
+            ACTIVE_GAUGE_INDEX[label]: int(idx)
+            for label, idx in pick_arrivals.get("default_picked_idx_by_label", {}).items()
+            if label in ACTIVE_GAUGE_INDEX
+        },
+        "default_pick_time_by_index": {
+            ACTIVE_GAUGE_INDEX[label]: float(value)
+            for label, value in pick_arrivals.get("default_pick_time_by_label", {}).items()
+            if label in ACTIVE_GAUGE_INDEX
+        },
+        "window_half_width_s": float(pick_arrivals.get("window_half_width_s", ZOOM_WINDOW_S)),
+    }
+
+
 class DynamicStrainArrivalPickerView(tk.Toplevel):
     def __init__(self, parent, run_idx, event_idx):
         self.parent = parent
@@ -95,6 +282,8 @@ class DynamicStrainArrivalPickerView(tk.Toplevel):
         self.fitted_line = None
         self.filtering = False
         self.xlim = None
+        self.plot_data = None
+        self.lower_time_abs = None
         self.init_event_combobox()
         self.on_selected_event_changed()
         self.on_resize()
@@ -125,16 +314,22 @@ class DynamicStrainArrivalPickerView(tk.Toplevel):
         self.axs[2].set_ylabel(r"$\delta_\mathrm{LP}\ \mathrm{({\mu}m)}$")
         self.axs[3].set_ylabel(r"$\delta\ \mathrm{({\mu}m)}$")
 
-        t = self.event["time"] - self.event["event_time"]
-        self.axs[0].plot(t, self.event["shear_stress"], linestyle, color="C0")
-        self.axs[1].plot(t, self.event["friction"], linestyle, color="C0")
-        self.axs[2].plot(t, self.event["LP_displacement"] - self.event["LP_displacement"][0], linestyle, color="C0")
-        self.axs[3].plot(t, self.event["displacement"] - self.event["displacement"][0], linestyle, color="C0")
+        self.plot_data = load_zoom_plot_data(self.event)
+        t = np.asarray(self.plot_data["top_rel_time"], dtype=np.float64)
+        tau_mpa = np.asarray(self.plot_data["tau_mpa"], dtype=np.float64)
+        mu = np.asarray(self.plot_data["mu"], dtype=np.float64)
+        delta_lp_um = np.asarray(self.plot_data["delta_lp_um"], dtype=np.float64)
+        delta_acc_um = np.asarray(self.plot_data["delta_acc_um"], dtype=np.float64)
 
-        tt = self.event["strain"]["original"]["time"] - self.event["event_time"]
-        y = np.copy(self.event["strain"]["original"]["raw"])
+        self.axs[0].plot(t, tau_mpa, linestyle, color="C0")
+        self.axs[1].plot(t, mu, linestyle, color="C0")
+        self.axs[2].plot(t, delta_lp_um, linestyle, color="C0")
+        self.axs[3].plot(t, delta_acc_um, linestyle, color="C0")
 
-        n_channels = y.shape[0]
+        tt = np.asarray(self.plot_data["lower_rel_time"], dtype=np.float64)
+        self.lower_time_abs = np.asarray(self.plot_data["lower_abs_time"], dtype=np.float64)
+
+        n_channels = len(self.event["strain"]["locations"])
         if self.enabled_channels is None:
             if "enabled_channels" in self.event["strain"]:
                 self.enabled_channels = self.event["strain"]["enabled_channels"]
@@ -164,26 +359,41 @@ class DynamicStrainArrivalPickerView(tk.Toplevel):
 
         if self.filtering:
             nf = int(self.filter_window_length.get())
-            for i in range(y.shape[0]):
-                y[i, :] = scipy.signal.savgol_filter(y[i, :], nf, 2)
+            filtered_by_index = {}
+            for i, values in self.plot_data["lower_by_index"].items():
+                filtered_by_index[i] = scipy.signal.savgol_filter(np.asarray(values, dtype=np.float64), nf, 2)
+        else:
+            filtered_by_index = {
+                i: np.asarray(values, dtype=np.float64)
+                for i, values in self.plot_data["lower_by_index"].items()
+            }
         line_idx = 0
-        ratios = np.ones(y.shape[0])
-        for i in range(y.shape[0]):
+        ratios = np.ones(n_channels)
+        channel_spacing_mm = compute_channel_spacing_mm(
+            self.event["strain"]["locations"], self.enabled_channels
+        )
+        target_span_mm = 0.8 * channel_spacing_mm
+        for i in range(n_channels):
             if not self.enabled_channels[i]:
+                continue
+            if i not in filtered_by_index:
                 continue
             loc = self.event["strain"]["locations"][i]
             self.axs[4].plot([tt[0], tt[-1]], [loc, loc], "k:", zorder=-101)
-            ratios[i] = -12 / (y[i, :].max() - y[i, :].min())
-            self.lines[i] = self.axs[4].plot(tt, y[i, :] * ratios[i] + loc, color="C%d" % line_idx, zorder=-100)
+            values = filtered_by_index[i]
+            amplitude = float(np.ptp(values))
+            ratios[i] = 0.0 if np.isclose(amplitude, 0.0) else -target_span_mm / amplitude
+            line_color = GAUGE_COLOR_BY_INDEX.get(i, f"C{line_idx}")
+            self.lines[i] = self.axs[4].plot(tt, values * ratios[i] + loc, color=line_color, zorder=-100)
             line_idx += 1
         self.axs[4].set_ylabel("location along fault (mm)")
         self.axs[4].set_xlabel("time - %f (s)" %  self.event["event_time"])
-        if exp_number >= 5958:
-            self.axs[4].set_ylim(160, -10)
-        else:
-            self.axs[4].set_ylim(105, 0)
+        self.axs[4].set_ylim(
+            *compute_strain_ylim(self.event["strain"]["locations"], self.enabled_channels)
+        )
         if self.xlim is None:
-            self.axs[0].set_xlim(tt[0], tt[-1])
+            half_window_s = float(self.plot_data.get("window_half_width_s", ZOOM_WINDOW_S))
+            self.axs[0].set_xlim(-half_window_s, half_window_s)
         else:
             self.axs[0].set_xlim(self.xlim)
         
@@ -192,11 +402,40 @@ class DynamicStrainArrivalPickerView(tk.Toplevel):
                                                   self.event_idx))
         
         if self.picked_idx is None:
-            if "picked_idx" in self.event["strain"]["original"]:
-                self.picked_idx = self.event["strain"]["original"]["picked_idx"]
+            middle_idx = int(len(tt) / 2)
+            self.picked_idx = [middle_idx for i in range(n_channels)]
+            original = self.event["strain"]["original"]
+            use_manual_picks = bool(original.get("manual_picks", False))
+
+            if use_manual_picks:
+                original_time_abs = np.asarray(original["time"], dtype=np.float64)
+                saved_times_abs = None
+                if "rupture_arrival_time" in original:
+                    saved_times_abs = np.asarray(original["rupture_arrival_time"], dtype=np.float64)
+                elif "picked_idx" in original:
+                    saved_times_abs = np.asarray(
+                        [
+                            original_time_abs[min(max(int(idx), 0), len(original_time_abs) - 1)]
+                            for idx in original["picked_idx"]
+                        ],
+                        dtype=np.float64,
+                    )
+                if saved_times_abs is not None and self.lower_time_abs is not None:
+                    for i in range(min(n_channels, len(saved_times_abs))):
+                        self.picked_idx[i] = int(np.argmin(np.abs(self.lower_time_abs - saved_times_abs[i])))
             else:
-                middle_idx = int(y.shape[1] / 2)
-                self.picked_idx = [middle_idx for i in range(n_channels)]
+                default_idx_by_index = self.plot_data.get("default_picked_idx_by_index", {})
+                default_time_by_index = self.plot_data.get("default_pick_time_by_index", {})
+                for i in range(n_channels):
+                    if i in default_idx_by_index:
+                        self.picked_idx[i] = int(default_idx_by_index[i])
+                    elif i in default_time_by_index and self.lower_time_abs is not None:
+                        self.picked_idx[i] = int(
+                            np.argmin(np.abs(self.lower_time_abs - float(default_time_by_index[i])))
+                        )
+                    elif self.lines[i] is not None:
+                        _, y_display = self.lines[i][0].get_data()
+                        self.picked_idx[i] = int(np.argmin(y_display))
         self.draw_markers()
 
     def draw_markers(self):
@@ -298,7 +537,10 @@ class DynamicStrainArrivalPickerView(tk.Toplevel):
         a = np.polyfit(y, x, 1)
         if self.fitted_line:
             self.fitted_line[0].remove()
-        self.fitted_line = self.axs[4].plot(a[0] * y + a[1], y, "r--")
+        y_limits = self.axs[4].get_ylim()
+        y_line = np.asarray([y_limits[0], y_limits[1]], dtype=np.float64)
+        x_line = a[0] * y_line + a[1]
+        self.fitted_line = self.axs[4].plot(x_line, y_line, "r--")
         self.canvas.draw()
         warnings.filterwarnings("ignore", message="divide by zero encountered in double_scalars")
         self.rupture_speed = -1e-3 / a[0]
@@ -313,8 +555,18 @@ class DynamicStrainArrivalPickerView(tk.Toplevel):
         self.event["strain"]["enabled_channels"] = self.enabled_channels
         self.event["strain"]["fitting_channels"] = self.fitting_channels
         self.event["rupture_speed"] = self.rupture_speed
-        self.event["strain"]["original"]["picked_idx"] = self.picked_idx
-        self.event["strain"]["original"]["rupture_arrival_time"] = np.array([self.event["strain"]["original"]["time"][i] for i in self.picked_idx])
+        original_time_abs = np.asarray(self.event["strain"]["original"]["time"], dtype=np.float64)
+        saved_idx = []
+        saved_time = []
+        for idx in self.picked_idx:
+            display_idx = min(max(int(idx), 0), len(self.lower_time_abs) - 1)
+            target_time_abs = self.lower_time_abs[display_idx]
+            original_idx = int(np.argmin(np.abs(original_time_abs - target_time_abs)))
+            saved_idx.append(original_idx)
+            saved_time.append(original_time_abs[original_idx])
+        self.event["strain"]["original"]["picked_idx"] = saved_idx
+        self.event["strain"]["original"]["rupture_arrival_time"] = np.asarray(saved_time, dtype=np.float64)
+        self.event["strain"]["original"]["manual_picks"] = True
         self.parent.refresh_tree()
         print(f"Saved runs[{self.run_idx}]/events[{self.event_idx}] to data.")
 
@@ -351,10 +603,7 @@ class DynamicStrainArrivalPickerView(tk.Toplevel):
             self.fitting_channels = self.event["strain"]["fitting_channels"]
         else:
             self.fitting_channels = None
-        if "picked_idx" in self.event["strain"]["original"]:
-            self.picked_idx = self.event["strain"]["original"]["picked_idx"]
-        else:
-            self.picked_idx = None
+        self.picked_idx = None
         self.xlim = None
         self.fitting_markers = []
         self.not_fitting_markers = []
@@ -363,6 +612,8 @@ class DynamicStrainArrivalPickerView(tk.Toplevel):
         self.currently_dragging = False
         self.rupture_speed = None
         self.fitted_line = None
+        self.plot_data = None
+        self.lower_time_abs = None
         self.plot()
         self.init_enabled_channels_mb()
         self.init_fitting_channels_mb()
