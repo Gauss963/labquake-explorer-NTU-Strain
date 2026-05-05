@@ -19,6 +19,7 @@ AUTO_FIT_WINDOW_MS = (
 AUTO_FIT_ONSET_SEARCH_WINDOW_S = AUTO_FIT_WINDOW_S
 AUTO_FIT_ONSET_THRESHOLD_FRACTION = 0.15
 AUTO_FIT_DISPLAY_THRESHOLD_FRACTION = 0.05
+AUTO_FIT_LEFT_BASELINE_WINDOW_S = 0.002
 AUTO_FIT_MIN_SAMPLES = 25
 AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2 = 1e6
 AUTO_FIT_PHYSICAL_BRANCH_RMSE_TOLERANCE = 1.15
@@ -51,6 +52,24 @@ def _moving_average(values, window):
         window += 1
     kernel = np.ones(window, dtype=np.float64) / window
     return np.convolve(data, kernel, mode="same")
+
+
+def _rezero_delta_tau_from_window_start(relative_time_s, delta_tau_mpa):
+    time_s = np.asarray(relative_time_s, dtype=np.float64)
+    signal_mpa = np.asarray(delta_tau_mpa, dtype=np.float64).copy()
+    if time_s.size == 0 or signal_mpa.size == 0:
+        return signal_mpa
+
+    baseline_end_s = min(float(time_s[0]) + AUTO_FIT_LEFT_BASELINE_WINDOW_S, float(time_s[-1]))
+    baseline_mask = time_s <= baseline_end_s
+    if not np.any(baseline_mask):
+        baseline_count = max(1, min(signal_mpa.size, signal_mpa.size // 100 or 1))
+        baseline = float(np.mean(signal_mpa[:baseline_count]))
+    else:
+        baseline = float(np.mean(signal_mpa[baseline_mask]))
+    signal_mpa -= baseline
+    signal_mpa -= float(signal_mpa[0])
+    return signal_mpa
 
 
 def _estimate_peak_time_s(relative_time_s, delta_tau_mpa):
@@ -358,7 +377,7 @@ class CZMFitterView(tk.Toplevel):
         self.event_combobox.bind("<<ComboboxSelected>>", self.on_event_changed)
         self.filter_spinbox.bind("<Return>", self.update_plot)
 
-        self.update_plot()
+        self.update_plot(preserve_xlim=False)
 
     def create_control_frame(self):
         control_frame = ttk.Frame(self)
@@ -483,8 +502,6 @@ class CZMFitterView(tk.Toplevel):
                     self._set_selected_gauge(params["strain_gauge"])
                 else:
                     self._set_selected_gauge(self.available_gauge_indices[0])
-            if has_pick_arrivals:
-                self.x_lim_min, self.x_lim_max = AUTO_FIT_WINDOW_S
             self._plot_vertical_lines([vline_x0, vline_x1, vline_x2])
             self.event["czm_parms"] = {
                 "Cf": self.Cf.get(),
@@ -543,7 +560,7 @@ class CZMFitterView(tk.Toplevel):
 
     def on_event_changed(self, event=None):
         self.load_event(int(self.event_combobox.get()))
-        self.update_plot()
+        self.update_plot(preserve_xlim=False)
 
     def on_gauge_changed(self, event=None):
         selected = self.gauge_combobox.get()
@@ -593,8 +610,14 @@ class CZMFitterView(tk.Toplevel):
             self.parent.refresh_tree()
             print(f"Saved parameters for event {self.event_idx}: {params}")
 
-    def update_plot(self, event=None):
+    def update_plot(self, event=None, preserve_xlim=True):
         has_pick_arrivals = isinstance(self.event.get("pick_arrivals"), dict)
+        current_display_xlim = None
+        if preserve_xlim and hasattr(self, "axs") and len(self.axs) > 0:
+            try:
+                current_display_xlim = tuple(float(value) for value in self.axs[0].get_xlim())
+            except Exception:
+                current_display_xlim = None
         line_unit_scale = 1e-3 if has_pick_arrivals else 1.0
         line_positions = []
         if self.vlines:
@@ -622,9 +645,12 @@ class CZMFitterView(tk.Toplevel):
 
         if selected_label and isinstance(pick_arrivals, dict) and selected_label in (pick_arrivals.get("delta_tau_mpa_by_label") or {}):
             t = np.asarray(pick_arrivals["relative_time_s"], dtype=np.float64)
-            delta_tau = np.asarray(pick_arrivals["delta_tau_mpa_by_label"][selected_label], dtype=np.float64)
+            delta_tau = _rezero_delta_tau_from_window_start(
+                t,
+                np.asarray(pick_arrivals["delta_tau_mpa_by_label"][selected_label], dtype=np.float64),
+            )
             t_ms = t * 1000.0
-            display_xlim = AUTO_FIT_WINDOW_MS
+            display_xlim = current_display_xlim if current_display_xlim is not None else AUTO_FIT_WINDOW_MS
             plot_line_positions = [position * 1000.0 for position in line_positions]
             if self.filtering:
                 window_length = self.filter_window.get()
@@ -726,7 +752,7 @@ class CZMFitterView(tk.Toplevel):
             idx_zero_xy = np.argmin(np.abs(t - line_positions[2]))
             self.axs[0].plot(t * 1000.0, exy - exy[idx_zero_xy], color=gauge_color, linewidth=1.2, label="Exy")
             plot_line_positions = [position * 1000.0 for position in line_positions]
-            display_xlim = (self.x_lim_min * 1000.0, self.x_lim_max * 1000.0)
+            display_xlim = current_display_xlim if current_display_xlim is not None else (self.x_lim_min * 1000.0, self.x_lim_max * 1000.0)
 
         fit_span_color = "tab:red"
         for ax in self.axs:
@@ -917,8 +943,9 @@ class CZMFitterView(tk.Toplevel):
         onset_map = {}
         arrival_times_s = {}
         for label in labels:
-            peak_info = _estimate_peak_time_s(relative_time_s, delta_tau_by_label[label])
-            onset_info = _estimate_onset_time_s(relative_time_s, delta_tau_by_label[label])
+            delta_tau_signal = _rezero_delta_tau_from_window_start(relative_time_s, delta_tau_by_label[label])
+            peak_info = _estimate_peak_time_s(relative_time_s, delta_tau_signal)
+            onset_info = _estimate_onset_time_s(relative_time_s, delta_tau_signal)
             peak_map[label] = peak_info
             onset_map[label] = onset_info
             arrival_times_s[label] = float(peak_info["peak_time_s"])
@@ -938,7 +965,8 @@ class CZMFitterView(tk.Toplevel):
             success = True
 
             for label in labels:
-                fit_problem = _build_fit_problem(relative_time_s, delta_tau_by_label[label], peak_map[label])
+                delta_tau_signal = _rezero_delta_tau_from_window_start(relative_time_s, delta_tau_by_label[label])
+                fit_problem = _build_fit_problem(relative_time_s, delta_tau_signal, peak_map[label])
                 x0 = np.array([2_000.0, 5.0, float(peak_map[label]["peak_time_s"])], dtype=np.float64)
                 lower = np.array([1e-3, 1e-3, float(fit_problem["fit_start_s"])], dtype=np.float64)
                 upper = np.array(
