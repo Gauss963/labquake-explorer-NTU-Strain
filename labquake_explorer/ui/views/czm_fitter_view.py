@@ -11,13 +11,12 @@ from labquake_explorer.utils.cohesive_crack import CohesiveCrack
 
 
 AUTO_FIT_DISTANCE_TO_FAULT_M = 0.005
-AUTO_FIT_ANALYSIS_WINDOW_S = (-0.010, 0.010)
-AUTO_FIT_DISPLAY_WINDOW_S = (-0.040, 0.040)
-AUTO_FIT_DISPLAY_WINDOW_MS = (
-    AUTO_FIT_DISPLAY_WINDOW_S[0] * 1000.0,
-    AUTO_FIT_DISPLAY_WINDOW_S[1] * 1000.0,
+AUTO_FIT_WINDOW_S = (-0.040, 0.040)
+AUTO_FIT_WINDOW_MS = (
+    AUTO_FIT_WINDOW_S[0] * 1000.0,
+    AUTO_FIT_WINDOW_S[1] * 1000.0,
 )
-AUTO_FIT_ONSET_SEARCH_WINDOW_S = (-0.004, 0.002)
+AUTO_FIT_ONSET_SEARCH_WINDOW_S = AUTO_FIT_WINDOW_S
 AUTO_FIT_ONSET_THRESHOLD_FRACTION = 0.15
 AUTO_FIT_DISPLAY_THRESHOLD_FRACTION = 0.05
 AUTO_FIT_MIN_SAMPLES = 25
@@ -57,11 +56,11 @@ def _moving_average(values, window):
 def _estimate_peak_time_s(relative_time_s, delta_tau_mpa):
     time_s = np.asarray(relative_time_s, dtype=np.float64)
     smooth_signal = _moving_average(delta_tau_mpa, 401)
-    search_mask = (time_s >= AUTO_FIT_ANALYSIS_WINDOW_S[0]) & (time_s <= AUTO_FIT_ANALYSIS_WINDOW_S[1])
+    search_mask = (time_s >= AUTO_FIT_WINDOW_S[0]) & (time_s <= AUTO_FIT_WINDOW_S[1])
     search_time = time_s[search_mask]
     search_signal = smooth_signal[search_mask]
     if search_signal.size == 0:
-        raise ValueError(f"No samples inside peak search window {AUTO_FIT_ANALYSIS_WINDOW_S}.")
+        raise ValueError(f"No samples inside peak search window {AUTO_FIT_WINDOW_S}.")
 
     peak_idx = int(np.argmax(search_signal))
     peak_time_s = float(search_time[peak_idx])
@@ -162,10 +161,10 @@ def _build_fit_problem(relative_time_s, delta_tau_mpa, peak_info):
     smooth_signal = np.asarray(peak_info["smooth_delta_tau_mpa"], dtype=np.float64)
     peak_time_s = float(peak_info["peak_time_s"])
 
-    analysis_mask = (time_s >= AUTO_FIT_ANALYSIS_WINDOW_S[0]) & (time_s <= AUTO_FIT_ANALYSIS_WINDOW_S[1])
+    analysis_mask = (time_s >= AUTO_FIT_WINDOW_S[0]) & (time_s <= AUTO_FIT_WINDOW_S[1])
     analysis_indices = np.flatnonzero(analysis_mask)
     if analysis_indices.size == 0:
-        raise ValueError(f"No samples found inside zoom window {AUTO_FIT_ANALYSIS_WINDOW_S}.")
+        raise ValueError(f"No samples found inside zoom window {AUTO_FIT_WINDOW_S}.")
 
     peak_idx = int(np.argmin(np.abs(time_s - peak_time_s)))
     start_idx = int(analysis_indices[0])
@@ -485,7 +484,7 @@ class CZMFitterView(tk.Toplevel):
                 else:
                     self._set_selected_gauge(self.available_gauge_indices[0])
             if has_pick_arrivals:
-                self.x_lim_min, self.x_lim_max = AUTO_FIT_DISPLAY_WINDOW_S
+                self.x_lim_min, self.x_lim_max = AUTO_FIT_WINDOW_S
             self._plot_vertical_lines([vline_x0, vline_x1, vline_x2])
             self.event["czm_parms"] = {
                 "Cf": self.Cf.get(),
@@ -625,7 +624,7 @@ class CZMFitterView(tk.Toplevel):
             t = np.asarray(pick_arrivals["relative_time_s"], dtype=np.float64)
             delta_tau = np.asarray(pick_arrivals["delta_tau_mpa_by_label"][selected_label], dtype=np.float64)
             t_ms = t * 1000.0
-            display_xlim = AUTO_FIT_DISPLAY_WINDOW_MS
+            display_xlim = AUTO_FIT_WINDOW_MS
             plot_line_positions = [position * 1000.0 for position in line_positions]
             if self.filtering:
                 window_length = self.filter_window.get()
@@ -863,7 +862,7 @@ class CZMFitterView(tk.Toplevel):
             return
         self.Cf.set(float(self.auto_fit_result["fit_summary"]["cf_mps"]))
         self.y.set(AUTO_FIT_DISTANCE_TO_FAULT_M)
-        self.x_lim_min, self.x_lim_max = AUTO_FIT_DISPLAY_WINDOW_S
+        self.x_lim_min, self.x_lim_max = AUTO_FIT_WINDOW_S
         self._apply_auto_fit_to_selected_gauge()
 
     def _apply_auto_fit_to_selected_gauge(self):
