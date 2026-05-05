@@ -18,6 +18,7 @@ AUTO_FIT_ZOOM_WINDOW_MS = (
 )
 AUTO_FIT_ONSET_SEARCH_WINDOW_S = (-0.004, 0.002)
 AUTO_FIT_ONSET_THRESHOLD_FRACTION = 0.15
+AUTO_FIT_DISPLAY_THRESHOLD_FRACTION = 0.05
 AUTO_FIT_MIN_SAMPLES = 25
 AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2 = 1e6
 AUTO_FIT_PHYSICAL_BRANCH_RMSE_TOLERANCE = 1.15
@@ -121,6 +122,37 @@ def _interpolate_crossing_time_s(t0_s, y0, t1_s, y1):
         return float(t1_s)
     frac = (0.0 - y0) / (y1 - y0)
     return float(t0_s + frac * (t1_s - t0_s))
+
+
+def _estimate_display_line_positions(fit_time_s, fit_model_mpa):
+    time_s = np.asarray(fit_time_s, dtype=np.float64)
+    model_mpa = np.asarray(fit_model_mpa, dtype=np.float64)
+    if time_s.size == 0 or model_mpa.size == 0 or time_s.size != model_mpa.size:
+        return None
+
+    amplitude = float(np.max(np.abs(model_mpa)))
+    if not np.isfinite(amplitude) or amplitude <= 0.0:
+        return {
+            "display_start_s": float(time_s[0]),
+            "model_peak_time_s": float(time_s[np.argmax(model_mpa)]),
+            "display_end_s": float(time_s[-1]),
+        }
+
+    threshold = AUTO_FIT_DISPLAY_THRESHOLD_FRACTION * amplitude
+    mask = np.abs(model_mpa) >= threshold
+    if not np.any(mask):
+        return {
+            "display_start_s": float(time_s[0]),
+            "model_peak_time_s": float(time_s[np.argmax(model_mpa)]),
+            "display_end_s": float(time_s[-1]),
+        }
+
+    indices = np.flatnonzero(mask)
+    return {
+        "display_start_s": float(time_s[indices[0]]),
+        "model_peak_time_s": float(time_s[np.argmax(model_mpa)]),
+        "display_end_s": float(time_s[indices[-1]]),
+    }
 
 
 def _build_fit_problem(relative_time_s, delta_tau_mpa, peak_info):
@@ -849,9 +881,9 @@ class CZMFitterView(tk.Toplevel):
         self.vlines_twin = []
         self._plot_vertical_lines(
             [
-                float(fit_result["fit_start_s"]),
-                float(fit_result["peak_time_s"]),
-                float(fit_result["fit_end_s"]),
+                float(fit_result.get("display_start_s", fit_result["fit_start_s"])),
+                float(fit_result.get("model_peak_time_s", fit_result["t0_s"])),
+                float(fit_result.get("display_end_s", fit_result["fit_end_s"])),
             ]
         )
 
@@ -968,6 +1000,12 @@ class CZMFitterView(tk.Toplevel):
                     "peak_delta_tau_mpa": float(peak_map[label]["peak_delta_tau_mpa"]),
                     "success": bool(result.success),
                 }
+                display_positions = _estimate_display_line_positions(
+                    fit_map[label]["fit_time_s"],
+                    fit_map[label]["fit_model_mpa"],
+                )
+                if display_positions is not None:
+                    fit_map[label].update(display_positions)
 
             fit_summary = {
                 "cf_mps": float(cf_mps),
