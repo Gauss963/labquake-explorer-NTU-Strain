@@ -16,6 +16,8 @@ AUTO_FIT_ZOOM_WINDOW_MS = (
     AUTO_FIT_ZOOM_WINDOW_S[0] * 1000.0,
     AUTO_FIT_ZOOM_WINDOW_S[1] * 1000.0,
 )
+AUTO_FIT_ONSET_SEARCH_WINDOW_S = (-0.004, 0.002)
+AUTO_FIT_ONSET_THRESHOLD_FRACTION = 0.15
 AUTO_FIT_MIN_SAMPLES = 25
 AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2 = 1e6
 AUTO_FIT_PHYSICAL_BRANCH_RMSE_TOLERANCE = 1.15
@@ -78,6 +80,38 @@ def _estimate_peak_time_s(relative_time_s, delta_tau_mpa):
     return {
         "peak_time_s": peak_time_s,
         "peak_delta_tau_mpa": peak_delta_tau_mpa,
+        "smooth_delta_tau_mpa": smooth_signal,
+    }
+
+
+def _estimate_onset_time_s(relative_time_s, delta_tau_mpa):
+    time_s = np.asarray(relative_time_s, dtype=np.float64)
+    smooth_signal = _moving_average(delta_tau_mpa, 401)
+    search_mask = (time_s >= AUTO_FIT_ONSET_SEARCH_WINDOW_S[0]) & (time_s <= AUTO_FIT_ONSET_SEARCH_WINDOW_S[1])
+    search_time = time_s[search_mask]
+    search_signal = smooth_signal[search_mask]
+    abs_signal = np.abs(search_signal)
+    peak_abs = float(np.max(abs_signal)) if abs_signal.size else 0.0
+    threshold_mpa = AUTO_FIT_ONSET_THRESHOLD_FRACTION * peak_abs
+
+    crossing_indices = np.where(abs_signal >= threshold_mpa)[0] if peak_abs > 0 else np.array([], dtype=np.int64)
+    if crossing_indices.size == 0:
+        onset_time_s = float(search_time[np.argmax(abs_signal)])
+    else:
+        idx = int(crossing_indices[0])
+        onset_time_s = float(search_time[idx])
+        if idx > 0:
+            t0 = float(search_time[idx - 1])
+            t1 = float(search_time[idx])
+            y0 = float(abs_signal[idx - 1])
+            y1 = float(abs_signal[idx])
+            if y1 != y0:
+                frac = (threshold_mpa - y0) / (y1 - y0)
+                onset_time_s = t0 + frac * (t1 - t0)
+
+    return {
+        "onset_time_s": onset_time_s,
+        "threshold_mpa": threshold_mpa,
         "smooth_delta_tau_mpa": smooth_signal,
     }
 
@@ -270,6 +304,7 @@ class CZMFitterView(tk.Toplevel):
         self.vlines_twin = []
         self.active_line_idx = None
         self.drag_active = False
+        self.user_adjusted_lines = False
 
         self.Cf = tk.DoubleVar()
         self.y = tk.DoubleVar()
@@ -393,6 +428,7 @@ class CZMFitterView(tk.Toplevel):
 
         self.event_idx = event_idx
         self.event = self.data_manager.get_data(f"runs/[{self.run_idx}]/events/[{self.event_idx}]")
+        self.user_adjusted_lines = False
 
         self.num_gauges = len(self.event["strain"]["original"]["raw"])
         self._configure_available_gauges()
@@ -566,7 +602,34 @@ class CZMFitterView(tk.Toplevel):
             fit_mask = (t >= line_positions[0]) & (t <= line_positions[2])
             fit_time = t[fit_mask]
             fit_data = delta_tau[fit_mask]
-            if fit_time.size > 0:
+            script_fit_result = None
+            if (
+                not self.user_adjusted_lines
+                and self.auto_fit_result is not None
+                and selected_label in self.auto_fit_result["fit_map"]
+            ):
+                script_fit_result = self.auto_fit_result["fit_map"][selected_label]
+
+            if script_fit_result is not None:
+                fit_time = np.asarray(script_fit_result["fit_time_s"], dtype=np.float64)
+                model_tau = np.asarray(script_fit_result["fit_model_mpa"], dtype=np.float64)
+                fit_data = np.asarray(script_fit_result["fit_data_mpa"], dtype=np.float64)
+                x_fit = -fit_time * self.Cf.get()
+                x_fit_zeroed = x_fit + float(script_fit_result["peak_time_s"]) * self.Cf.get()
+                delta_sigma_xx, _, _ = CohesiveCrack.delta_sigmas(
+                    x_fit_zeroed,
+                    self.y.get(),
+                    self.Xc.get(),
+                    self.Cf.get(),
+                    self.C_s,
+                    self.C_d,
+                    self.nu,
+                    self.Gc.get(),
+                    self.E,
+                )
+                delta_e_xx = np.asarray(delta_sigma_xx, dtype=np.float64) / self.E
+                delta_e_xx -= delta_e_xx[0]
+            elif fit_time.size > 0:
                 baseline_mask = np.zeros_like(fit_time, dtype=bool)
                 edge_count = min(5, fit_time.size)
                 baseline_mask[:edge_count] = True
@@ -684,6 +747,7 @@ class CZMFitterView(tk.Toplevel):
         self.drag_active = False
         self.active_line_idx = None
         if dragged:
+            self.user_adjusted_lines = True
             self.update_plot()
 
     def on_mouse_move(self, event):
@@ -711,6 +775,7 @@ class CZMFitterView(tk.Toplevel):
             return
 
         self.auto_fit_result = auto_fit
+        self.user_adjusted_lines = False
         self.Cf.set(float(auto_fit["fit_summary"]["cf_mps"]))
         self.y.set(AUTO_FIT_DISTANCE_TO_FAULT_M)
         self._apply_auto_fit_to_selected_gauge()
@@ -769,6 +834,7 @@ class CZMFitterView(tk.Toplevel):
     def _apply_auto_fit_to_selected_gauge(self):
         if not self.auto_fit_result:
             return
+        self.user_adjusted_lines = False
         selected_label = self.gauge_index_to_option.get(self.strain_gauge.get())
         if selected_label not in self.auto_fit_result["fit_map"]:
             selected_label = next(iter(self.auto_fit_result["fit_map"]))
@@ -784,7 +850,7 @@ class CZMFitterView(tk.Toplevel):
         self._plot_vertical_lines(
             [
                 float(fit_result["fit_start_s"]),
-                float(fit_result["t0_s"]),
+                float(fit_result["peak_time_s"]),
                 float(fit_result["fit_end_s"]),
             ]
         )
@@ -814,10 +880,13 @@ class CZMFitterView(tk.Toplevel):
         positions_m = {label: (positions_mm[label] - min_position_mm) / 1000.0 for label in labels}
 
         peak_map = {}
+        onset_map = {}
         arrival_times_s = {}
         for label in labels:
             peak_info = _estimate_peak_time_s(relative_time_s, delta_tau_by_label[label])
+            onset_info = _estimate_onset_time_s(relative_time_s, delta_tau_by_label[label])
             peak_map[label] = peak_info
+            onset_map[label] = onset_info
             arrival_times_s[label] = float(peak_info["peak_time_s"])
 
         cf_result = _estimate_velocity_from_arrivals(arrival_times_s, positions_m, labels)
@@ -890,9 +959,11 @@ class CZMFitterView(tk.Toplevel):
                     "rmse_mpa": rmse_mpa,
                     "fit_model_mpa": fit_model_mpa,
                     "fit_data_mpa": fit_data_mpa,
+                    "fit_time_s": np.asarray(fit_problem["fit_time_s"]),
                     "fit_mask": np.asarray(fit_problem["fit_mask"]),
                     "fit_start_s": float(fit_problem["fit_start_s"]),
                     "fit_end_s": float(fit_problem["fit_end_s"]),
+                    "onset_time_s": float(onset_map[label]["onset_time_s"]),
                     "peak_time_s": float(peak_map[label]["peak_time_s"]),
                     "peak_delta_tau_mpa": float(peak_map[label]["peak_delta_tau_mpa"]),
                     "success": bool(result.success),
