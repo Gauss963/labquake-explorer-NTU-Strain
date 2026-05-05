@@ -526,10 +526,12 @@ class CZMFitterView(tk.Toplevel):
     def _plot_vertical_lines(self, positions):
         if not hasattr(self, "axs"):
             return
+        display_scale = 1000.0 if isinstance(self.event.get("pick_arrivals"), dict) else 1.0
         for i, x_pos in enumerate(positions):
             color = "r" if i == 1 else "g"
-            vline = self.axs[0].axvline(x=x_pos, color=color, linestyle="--", alpha=0.5)
-            vline_twin = self.axs[1].axvline(x=x_pos, color=color, linestyle="--", alpha=0.5)
+            x_display = x_pos * display_scale
+            vline = self.axs[0].axvline(x=x_display, color=color, linestyle="--", alpha=0.5)
+            vline_twin = self.axs[1].axvline(x=x_display, color=color, linestyle="--", alpha=0.5)
             self.vlines.append(vline)
             self.vlines_twin.append(vline_twin)
 
