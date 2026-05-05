@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Background with Apple-style gradient -->
+  <defs>
+    <linearGradient id="bgGradient" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" style="stop-color:#5F7EC1"/>
+      <stop offset="100%" style="stop-color:#2B4170"/>
+    </linearGradient>
+    <!-- Apple-style soft glow -->
+    <filter id="softGlow">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Adjusted Squircle background (shrunk to match reference) -->
+  <g transform="translate(100, 100) scale(0.82)">
+    <path d="
+      M 232 0
+      H 792
+      C 912 0 1024 112 1024 232
+      V 792
+      C 1024 912 912 1024 792 1024
+      H 232
+      C 112 1024 0 912 0 792
+      V 232
+      C 0 112 112 0 232 0
+      Z" fill="url(#bgGradient)"/>
+  </g>
+
+  <!-- Group containing the scaled wave and grid, reduced further -->
+  <g transform="translate(512, 512) scale(0.70) translate(-512, -512)">
+    <!-- Main seismic wave with Apple's smooth curves -->
+    <path d="M142 562 
+             C192 562, 232 562, 256 562
+             C276 562, 286 367, 306 192
+             C372 -33, 522 1150, 768 732
+             C768 732, 812 732, 902 732" 
+          stroke="white" 
+          stroke-width="64" 
+          fill="none" 
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          filter="url(#softGlow)"
+          opacity="0.98"/>
+
+    <!-- Grid lines - adjusted to align with wave -->
+    <g stroke="white" stroke-width="6" opacity="0.15">
+      <!-- Horizontal lines -->
+      <line x1="142" y1="222" x2="902" y2="222"/>
+      <line x1="142" y1="392" x2="902" y2="392"/>
+      <line x1="142" y1="562" x2="902" y2="562"/>
+      <line x1="142" y1="732" x2="902" y2="732"/>
+
+      <!-- Vertical lines -->
+      <line x1="256" y1="142" x2="256" y2="902"/>
+      <line x1="512" y1="142" x2="512" y2="902"/>
+      <line x1="768" y1="142" x2="768" y2="902"/>
+    </g>
+  </g>
+</svg>
