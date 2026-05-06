@@ -67,9 +67,7 @@ def _rezero_delta_tau_from_window_start(relative_time_s, delta_tau_mpa):
         baseline = float(np.mean(signal_mpa[:baseline_count]))
     else:
         baseline = float(np.mean(signal_mpa[baseline_mask]))
-    signal_mpa -= baseline
-    signal_mpa -= float(signal_mpa[0])
-    return signal_mpa
+    return signal_mpa - baseline
 
 
 def _estimate_peak_time_s(relative_time_s, delta_tau_mpa):
