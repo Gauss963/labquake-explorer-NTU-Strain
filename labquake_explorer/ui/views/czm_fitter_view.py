@@ -71,6 +71,15 @@ def _rezero_delta_tau_from_window_start(relative_time_s, delta_tau_mpa):
     return signal_mpa - baseline
 
 
+def _normalize_filter_window_length(window_length, signal_size):
+    window_length = int(window_length)
+    window_length = max(3, window_length)
+    window_length = min(window_length, int(signal_size))
+    if window_length % 2 == 0:
+        window_length -= 1
+    return max(3, window_length)
+
+
 def _estimate_peak_time_s(relative_time_s, delta_tau_mpa):
     time_s = np.asarray(relative_time_s, dtype=np.float64)
     smooth_signal = _moving_average(delta_tau_mpa, 401)
@@ -578,11 +587,24 @@ class CZMFitterView(tk.Toplevel):
             self.filter_button.config(text="Filter On", relief="sunken")
         else:
             self.filter_button.config(text="Filter Off", relief="raised")
+        if not self.user_adjusted_lines:
+            self.auto_fit_result = self._compute_script_style_auto_fit(cf_override=self.Cf.get())
+            if self.auto_fit_result is not None and "czm_parms" not in self.event:
+                self._apply_auto_fit_to_selected_gauge()
         self.update_plot()
 
     def apply_manual_update(self):
         self.user_adjusted_lines = True
         self.update_plot()
+
+    def _get_delta_tau_signal(self, relative_time_s, delta_tau_signal):
+        signal_mpa = _rezero_delta_tau_from_window_start(relative_time_s, delta_tau_signal)
+        if not self.filtering:
+            return signal_mpa
+        window_length = _normalize_filter_window_length(self.filter_window.get(), signal_mpa.size)
+        if self.filter_window.get() != window_length:
+            self.filter_window.set(window_length)
+        return signal.savgol_filter(signal_mpa, window_length, 2)
 
     def save_parameters(self):
         if len(self.vlines) >= 3:
@@ -655,19 +677,13 @@ class CZMFitterView(tk.Toplevel):
 
         if selected_label and isinstance(pick_arrivals, dict) and selected_label in (pick_arrivals.get("delta_tau_mpa_by_label") or {}):
             t = np.asarray(pick_arrivals["relative_time_s"], dtype=np.float64)
-            delta_tau = _rezero_delta_tau_from_window_start(
+            delta_tau = self._get_delta_tau_signal(
                 t,
                 np.asarray(pick_arrivals["delta_tau_mpa_by_label"][selected_label], dtype=np.float64),
             )
             t_ms = t * 1000.0
             display_xlim = current_display_xlim if current_display_xlim is not None else AUTO_FIT_WINDOW_MS
             plot_line_positions = [position * 1000.0 for position in line_positions]
-            if self.filtering:
-                window_length = self.filter_window.get()
-                if window_length % 2 == 0:
-                    window_length += 1
-                    self.filter_window.set(window_length)
-                delta_tau = signal.savgol_filter(delta_tau, window_length, 2)
 
             fit_mask = (t >= line_positions[0]) & (t <= line_positions[2])
             fit_time = t[fit_mask]
@@ -953,7 +969,7 @@ class CZMFitterView(tk.Toplevel):
         onset_map = {}
         arrival_times_s = {}
         for label in labels:
-            delta_tau_signal = _rezero_delta_tau_from_window_start(relative_time_s, delta_tau_by_label[label])
+            delta_tau_signal = self._get_delta_tau_signal(relative_time_s, delta_tau_by_label[label])
             peak_info = _estimate_peak_time_s(relative_time_s, delta_tau_signal)
             onset_info = _estimate_onset_time_s(relative_time_s, delta_tau_signal)
             peak_map[label] = peak_info
@@ -975,7 +991,7 @@ class CZMFitterView(tk.Toplevel):
             success = True
 
             for label in labels:
-                delta_tau_signal = _rezero_delta_tau_from_window_start(relative_time_s, delta_tau_by_label[label])
+                delta_tau_signal = self._get_delta_tau_signal(relative_time_s, delta_tau_by_label[label])
                 fit_problem = _build_fit_problem(relative_time_s, delta_tau_signal, peak_map[label])
                 x0 = np.array([2_000.0, 5.0, float(peak_map[label]["peak_time_s"])], dtype=np.float64)
                 lower = np.array([1e-3, 1e-3, float(fit_problem["fit_start_s"])], dtype=np.float64)
