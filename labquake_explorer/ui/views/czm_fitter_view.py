@@ -906,13 +906,27 @@ class CZMFitterView(tk.Toplevel):
             "y_m": self.y.get(),
         }
 
+        cf_seed_mps = float(self.Cf.get())
+        auto_cf_mps = None
+        if self.auto_fit_result is not None:
+            auto_cf_mps = float(self.auto_fit_result["fit_summary"]["cf_mps"])
+        if not np.isfinite(cf_seed_mps) or cf_seed_mps <= 1.0:
+            if auto_cf_mps is not None and np.isfinite(auto_cf_mps) and auto_cf_mps > 1.0:
+                cf_seed_mps = auto_cf_mps
+            else:
+                cf_seed_mps = max(1.0, 0.1 * self.C_s)
+
+        cf_lower_mps = max(1.0, 0.25 * cf_seed_mps)
+        cf_upper_mps = min(0.99 * self.C_s, max(cf_lower_mps + 1.0, 4.0 * cf_seed_mps))
+        cf_seed_mps = min(max(cf_seed_mps, cf_lower_mps), cf_upper_mps)
+
         e_prime = self.E / (1.0 - self.nu**2)
         tau_c_pa0 = np.sqrt(
             max((9.0 * np.pi / 32.0) * e_prime * self.Gc.get() / max(self.Xc.get(), 1e-12), 1e-12)
         )
         x0 = np.array(
             [
-                max(self.Cf.get() / self.C_s, 1e-6),
+                max(cf_seed_mps / self.C_s, 1e-6),
                 max(self.Gc.get(), 1e-6),
                 tau_c_pa0 / 1e6,
                 line_positions[1],
@@ -920,8 +934,14 @@ class CZMFitterView(tk.Toplevel):
             ],
             dtype=np.float64,
         )
-        lower = np.array([1e-6, 1e-6, 1e-6, float(fit_time_s[0]), -5.0], dtype=np.float64)
-        upper = np.array([0.999, AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2, 1_000.0, float(fit_time_s[-1]), 5.0], dtype=np.float64)
+        lower = np.array(
+            [cf_lower_mps / self.C_s, 1e-6, 1e-6, float(fit_time_s[0]), -5.0],
+            dtype=np.float64,
+        )
+        upper = np.array(
+            [cf_upper_mps / self.C_s, AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2, 1_000.0, float(fit_time_s[-1]), 5.0],
+            dtype=np.float64,
+        )
 
         x_sign = -1
         if self.auto_fit_result is not None:
