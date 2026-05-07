@@ -464,7 +464,7 @@ class CZMFitterView(tk.Toplevel):
         button_frame = ttk.Frame(params_frame)
         button_frame.pack(side=tk.LEFT, padx=10)
 
-        ttk.Button(button_frame, text="Update", command=self.update_plot).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Update", command=self.apply_manual_update).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Fit", command=self.fit_parameters).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Save", command=self.save_parameters).pack(side=tk.LEFT, padx=5)
 
@@ -578,6 +578,10 @@ class CZMFitterView(tk.Toplevel):
             self.filter_button.config(text="Filter On", relief="sunken")
         else:
             self.filter_button.config(text="Filter Off", relief="raised")
+        self.update_plot()
+
+    def apply_manual_update(self):
+        self.user_adjusted_lines = True
         self.update_plot()
 
     def save_parameters(self):
