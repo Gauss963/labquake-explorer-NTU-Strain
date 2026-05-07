@@ -269,8 +269,13 @@ def _estimate_velocity_from_arrivals(arrival_times_s, positions_m, labels):
 
 
 def _model_delta_tau(theta, *, fit_problem, x_sign, cs_mps, cd_mps):
-    cf_ratio, gamma_j_m2, tau_c_mpa, t0_s = theta
-    if cf_ratio <= 0 or gamma_j_m2 <= 0 or tau_c_mpa <= 0:
+    theta = np.asarray(theta, dtype=np.float64)
+    if theta.size < 4:
+        return np.full_like(fit_problem["fit_data_mpa"], 1e6)
+
+    cf_ratio, gamma_j_m2, tau_c_mpa, t0_s = theta[:4]
+    tau_residual_mpa = float(theta[4]) if theta.size >= 5 else 0.0
+    if cf_ratio <= 0 or gamma_j_m2 <= 0 or tau_c_mpa <= 0 or cf_ratio >= 1.0:
         return np.full_like(fit_problem["fit_data_mpa"], 1e6)
 
     cf_mps = cf_ratio * cs_mps
@@ -278,9 +283,10 @@ def _model_delta_tau(theta, *, fit_problem, x_sign, cs_mps, cd_mps):
     try:
         xc_m = _compute_xc_modeii_si(AUTO_FIT_YOUNGS_MODULUS_PA, AUTO_FIT_POISSON_RATIO, tau_c_pa, gamma_j_m2)
         x_m = x_sign * cf_mps * (np.asarray(fit_problem["fit_time_s"], dtype=np.float64) - t0_s)
+        y_m = float(fit_problem.get("y_m", AUTO_FIT_DISTANCE_TO_FAULT_M))
         _, model_tau_pa, _ = CohesiveCrack.delta_sigmas(
             x_m,
-            AUTO_FIT_DISTANCE_TO_FAULT_M,
+            y_m,
             xc_m,
             cf_mps,
             cs_mps,
@@ -296,35 +302,25 @@ def _model_delta_tau(theta, *, fit_problem, x_sign, cs_mps, cd_mps):
     if not np.all(np.isfinite(model_tau_mpa)):
         return np.full_like(fit_problem["fit_data_mpa"], 1e6)
 
-    fit_time_s = np.asarray(fit_problem["fit_time_s"], dtype=np.float64)
-    baseline_mask = np.asarray(fit_problem["fit_baseline_mask"], dtype=bool)
-    baseline_idx = np.flatnonzero(baseline_mask)
-    if baseline_idx.size < 2:
-        baseline_mean = float(np.mean(model_tau_mpa[baseline_mask])) if np.any(baseline_mask) else float(np.mean(model_tau_mpa))
-        return model_tau_mpa - baseline_mean
-
-    split = baseline_idx.size // 2
-    left_idx = baseline_idx[:split]
-    right_idx = baseline_idx[split:]
-    if left_idx.size == 0 or right_idx.size == 0:
-        baseline_mean = float(np.mean(model_tau_mpa[baseline_mask]))
-        return model_tau_mpa - baseline_mean
-
-    t_left = float(np.mean(fit_time_s[left_idx]))
-    t_right = float(np.mean(fit_time_s[right_idx]))
-    y_left = float(np.mean(model_tau_mpa[left_idx]))
-    y_right = float(np.mean(model_tau_mpa[right_idx]))
-    if np.isclose(t_right, t_left):
-        baseline = np.full_like(model_tau_mpa, 0.5 * (y_left + y_right))
-    else:
-        baseline = y_left + (y_right - y_left) * (fit_time_s - t_left) / (t_right - t_left)
-    return model_tau_mpa - baseline
+    left_count = max(1, min(5, model_tau_mpa.size))
+    baseline_mean = float(np.mean(model_tau_mpa[:left_count]))
+    return model_tau_mpa - baseline_mean + tau_residual_mpa
 
 
 def _residuals_fixed_cf(theta, *, fit_problem, cf_ratio, x_sign, cs_mps, cd_mps):
     local_theta = np.concatenate(([cf_ratio], np.asarray(theta, dtype=np.float64)))
     return _model_delta_tau(
         local_theta,
+        fit_problem=fit_problem,
+        x_sign=x_sign,
+        cs_mps=cs_mps,
+        cd_mps=cd_mps,
+    ) - fit_problem["fit_data_mpa"]
+
+
+def _residuals_free_cf(theta, *, fit_problem, x_sign, cs_mps, cd_mps):
+    return _model_delta_tau(
+        theta,
         fit_problem=fit_problem,
         x_sign=x_sign,
         cs_mps=cs_mps,
@@ -369,6 +365,7 @@ class CZMFitterView(tk.Toplevel):
         self.y = tk.DoubleVar()
         self.Xc = tk.DoubleVar()
         self.Gc = tk.DoubleVar()
+        self.tau_residual = tk.DoubleVar()
 
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -455,6 +452,7 @@ class CZMFitterView(tk.Toplevel):
             ("y", self.y, 1e-3),
             ("Xc", self.Xc, 1e-4),
             ("Gc", self.Gc, 1),
+            ("tau_res", self.tau_residual, 0.01),
         ]
         for label_text, var, increment in param_configs:
             frame = ttk.Frame(params_frame)
@@ -497,13 +495,19 @@ class CZMFitterView(tk.Toplevel):
         if "czm_parms" in self.event:
             params = self.event["czm_parms"]
             if isinstance(params, list) and len(params) == 8:
-                self._set_parameters(*params[:4])
+                self._set_parameters(*params[:4], 0.0)
                 vline_x0, vline_x1 = params[4], params[5]
                 vline_x2 = vline_x1 * 2 - vline_x0
                 self.x_lim_min, self.x_lim_max = params[6], params[7]
                 self._set_selected_gauge(self.available_gauge_indices[0])
             elif isinstance(params, dict):
-                self._set_parameters(params["Cf"], params["y"], params["Xc"], params["Gc"])
+                self._set_parameters(
+                    params["Cf"],
+                    params["y"],
+                    params["Xc"],
+                    params["Gc"],
+                    params.get("tau_residual_mpa", 0.0),
+                )
                 vline_x0, vline_x1, vline_x2 = params["x_min"], params["x_tip"], params["x_max"]
                 self.x_lim_min, self.x_lim_max = params["x_lim_min"], params["x_lim_max"]
                 if "strain_gauge" in params and params["strain_gauge"] in self.available_gauge_indices:
@@ -529,11 +533,12 @@ class CZMFitterView(tk.Toplevel):
 
         self.axs[0].set_xlim(self.x_lim_min, self.x_lim_max)
 
-    def _set_parameters(self, Cf, y, Xc, Gc):
+    def _set_parameters(self, Cf, y, Xc, Gc, tau_residual_mpa=0.0):
         self.Cf.set(Cf)
         self.y.set(y)
         self.Xc.set(Xc)
         self.Gc.set(Gc)
+        self.tau_residual.set(tau_residual_mpa)
 
     def _set_default_parameters(self):
         self.x_lim_min, self.x_lim_max = -0.1, 0.1
@@ -547,6 +552,7 @@ class CZMFitterView(tk.Toplevel):
         self.y.set(AUTO_FIT_DISTANCE_TO_FAULT_M)
         self.Xc.set(1)
         self.Gc.set(1)
+        self.tau_residual.set(0.0)
 
     def _plot_vertical_lines(self, positions):
         if not hasattr(self, "axs"):
@@ -620,6 +626,7 @@ class CZMFitterView(tk.Toplevel):
                 "y": self.y.get(),
                 "Xc": self.Xc.get(),
                 "Gc": self.Gc.get(),
+                "tau_residual_mpa": self.tau_residual.get(),
                 "strain_gauge": self.strain_gauge.get(),
                 "x_min": vline_x0,
                 "x_tip": vline_x1,
@@ -728,11 +735,21 @@ class CZMFitterView(tk.Toplevel):
                     "fit_time_s": fit_time,
                     "fit_data_mpa": fit_data,
                     "fit_baseline_mask": baseline_mask,
+                    "y_m": self.y.get(),
                 }
                 x_sign = -1
                 if self.auto_fit_result is not None:
                     x_sign = int(self.auto_fit_result["fit_summary"]["x_sign"])
-                theta = np.array([self.Cf.get() / self.C_s, self.Gc.get(), tau_c_mpa, line_positions[1]], dtype=np.float64)
+                theta = np.array(
+                    [
+                        self.Cf.get() / self.C_s,
+                        self.Gc.get(),
+                        tau_c_mpa,
+                        line_positions[1],
+                        self.tau_residual.get(),
+                    ],
+                    dtype=np.float64,
+                )
                 model_tau = _model_delta_tau(
                     theta,
                     fit_problem=fit_problem,
@@ -855,24 +872,91 @@ class CZMFitterView(tk.Toplevel):
             return False
 
     def fit_parameters(self):
-        auto_fit = self._compute_script_style_auto_fit(cf_override=self.Cf.get())
-        if auto_fit is None:
-            print("Script-style auto fit is unavailable for this event.")
+        pick_arrivals = self.event.get("pick_arrivals")
+        selected_label = self.gauge_index_to_option.get(self.strain_gauge.get())
+        if (
+            not isinstance(pick_arrivals, dict)
+            or selected_label not in (pick_arrivals.get("delta_tau_mpa_by_label") or {})
+            or len(self.vlines) < 3
+        ):
+            print("Manual CZM fit is unavailable for this event.")
             return
 
-        self.auto_fit_result = auto_fit
-        self.user_adjusted_lines = False
-        self.Cf.set(float(auto_fit["fit_summary"]["cf_mps"]))
-        self.y.set(AUTO_FIT_DISTANCE_TO_FAULT_M)
-        self._apply_auto_fit_to_selected_gauge()
-        self.update_plot()
+        relative_time_s = np.asarray(pick_arrivals["relative_time_s"], dtype=np.float64)
+        delta_tau_signal = self._get_delta_tau_signal(
+            relative_time_s,
+            np.asarray(pick_arrivals["delta_tau_mpa_by_label"][selected_label], dtype=np.float64),
+        )
+        line_positions = [line.get_xdata()[0] * 1e-3 for line in self.vlines]
+        fit_mask = (relative_time_s >= line_positions[0]) & (relative_time_s <= line_positions[2])
+        fit_time_s = relative_time_s[fit_mask]
+        fit_data_mpa = delta_tau_signal[fit_mask]
+        if fit_time_s.size < AUTO_FIT_MIN_SAMPLES:
+            print("Selected fit window is too small for manual CZM fitting.")
+            return
 
-        selected_label = self.gauge_index_to_option.get(self.strain_gauge.get(), "selected")
-        fit_result = auto_fit["fit_map"].get(selected_label, next(iter(auto_fit["fit_map"].values())))
+        baseline_mask = np.zeros_like(fit_time_s, dtype=bool)
+        edge_count = min(5, fit_time_s.size)
+        baseline_mask[:edge_count] = True
+        baseline_mask[-edge_count:] = True
+        fit_problem = {
+            "fit_time_s": fit_time_s,
+            "fit_data_mpa": fit_data_mpa,
+            "fit_baseline_mask": baseline_mask,
+            "y_m": self.y.get(),
+        }
+
+        e_prime = self.E / (1.0 - self.nu**2)
+        tau_c_pa0 = np.sqrt(
+            max((9.0 * np.pi / 32.0) * e_prime * self.Gc.get() / max(self.Xc.get(), 1e-12), 1e-12)
+        )
+        x0 = np.array(
+            [
+                max(self.Cf.get() / self.C_s, 1e-6),
+                max(self.Gc.get(), 1e-6),
+                tau_c_pa0 / 1e6,
+                line_positions[1],
+                self.tau_residual.get(),
+            ],
+            dtype=np.float64,
+        )
+        lower = np.array([1e-6, 1e-6, 1e-6, float(fit_time_s[0]), -5.0], dtype=np.float64)
+        upper = np.array([0.999, AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2, 1_000.0, float(fit_time_s[-1]), 5.0], dtype=np.float64)
+
+        x_sign = -1
+        if self.auto_fit_result is not None:
+            x_sign = int(self.auto_fit_result["fit_summary"]["x_sign"])
+
+        result = optimize.least_squares(
+            _residuals_free_cf,
+            x0,
+            bounds=(lower, upper),
+            kwargs={
+                "fit_problem": fit_problem,
+                "x_sign": x_sign,
+                "cs_mps": self.C_s,
+                "cd_mps": self.C_d,
+            },
+            loss="soft_l1",
+            f_scale=0.2,
+            max_nfev=AUTO_FIT_MAX_EVALS,
+        )
+
+        cf_ratio, gamma_j_m2, tau_c_mpa, t0_s, tau_residual_mpa = np.asarray(result.x, dtype=np.float64)
+        xc_m = _compute_xc_modeii_si(self.E, self.nu, float(tau_c_mpa) * 1e6, float(gamma_j_m2))
+
+        self.Cf.set(float(cf_ratio * self.C_s))
+        self.Gc.set(float(gamma_j_m2))
+        self.Xc.set(float(xc_m))
+        self.tau_residual.set(float(tau_residual_mpa))
+        self.user_adjusted_lines = True
+        self.vlines[1].set_xdata([t0_s * 1000.0, t0_s * 1000.0])
+        self.vlines_twin[1].set_xdata([t0_s * 1000.0, t0_s * 1000.0])
+        self.update_plot()
         print(
-            f"Auto-fit ({selected_label}): Cf={auto_fit['fit_summary']['cf_mps']:.1f} m/s, "
-            f"Gc={fit_result['gamma_j_m2']:.3e} J/m^2, Xc={fit_result['xc_mm']:.2f} mm, "
-            f"t0={fit_result['t0_s'] * 1000.0:.3f} ms, branch={auto_fit['fit_summary']['x_sign']}"
+            f"Manual fit ({selected_label}): Cf={self.Cf.get():.1f} m/s, "
+            f"Gc={self.Gc.get():.3e} J/m^2, Xc={self.Xc.get() * 1000.0:.2f} mm, "
+            f"t0={t0_s * 1000.0:.3f} ms, tau_res={self.tau_residual.get():.3f} MPa, success={bool(result.success)}"
         )
 
     def _configure_available_gauges(self):
@@ -927,6 +1011,7 @@ class CZMFitterView(tk.Toplevel):
         fit_result = self.auto_fit_result["fit_map"][selected_label]
         self.Xc.set(float(fit_result["xc_m"]))
         self.Gc.set(float(fit_result["gamma_j_m2"]))
+        self.tau_residual.set(float(fit_result.get("tau_residual_mpa", 0.0)))
         for line in self.vlines:
             line.remove()
         for line in self.vlines_twin:
@@ -993,13 +1078,15 @@ class CZMFitterView(tk.Toplevel):
             for label in labels:
                 delta_tau_signal = self._get_delta_tau_signal(relative_time_s, delta_tau_by_label[label])
                 fit_problem = _build_fit_problem(relative_time_s, delta_tau_signal, peak_map[label])
-                x0 = np.array([2_000.0, 5.0, float(peak_map[label]["peak_time_s"])], dtype=np.float64)
-                lower = np.array([1e-3, 1e-3, float(fit_problem["fit_start_s"])], dtype=np.float64)
+                fit_problem["y_m"] = AUTO_FIT_DISTANCE_TO_FAULT_M
+                x0 = np.array([2_000.0, 5.0, float(peak_map[label]["peak_time_s"]), 0.0], dtype=np.float64)
+                lower = np.array([1e-3, 1e-3, float(fit_problem["fit_start_s"]), -5.0], dtype=np.float64)
                 upper = np.array(
                     [
                         AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2,
                         1_000.0,
                         float(fit_problem["fit_end_s"]),
+                        5.0,
                     ],
                     dtype=np.float64,
                 )
@@ -1019,8 +1106,11 @@ class CZMFitterView(tk.Toplevel):
                     max_nfev=AUTO_FIT_MAX_EVALS,
                 )
 
-                gamma_j_m2, tau_c_mpa, t0_s = np.asarray(result.x, dtype=np.float64)
-                local_theta = np.array([float(cf_mps / self.C_s), gamma_j_m2, tau_c_mpa, t0_s], dtype=np.float64)
+                gamma_j_m2, tau_c_mpa, t0_s, tau_residual_mpa = np.asarray(result.x, dtype=np.float64)
+                local_theta = np.array(
+                    [float(cf_mps / self.C_s), gamma_j_m2, tau_c_mpa, t0_s, tau_residual_mpa],
+                    dtype=np.float64,
+                )
                 fit_model_mpa = _model_delta_tau(
                     local_theta,
                     fit_problem=fit_problem,
@@ -1044,6 +1134,7 @@ class CZMFitterView(tk.Toplevel):
                     "xc_m": float(xc_m),
                     "xc_mm": float(xc_m * 1000.0),
                     "t0_s": float(t0_s),
+                    "tau_residual_mpa": float(tau_residual_mpa),
                     "rmse_mpa": rmse_mpa,
                     "fit_model_mpa": fit_model_mpa,
                     "fit_data_mpa": fit_data_mpa,
