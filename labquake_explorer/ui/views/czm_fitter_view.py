@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -587,6 +588,7 @@ class CZMFitterView(tk.Toplevel):
             vline_x2 = self.vlines[2].get_xdata()[0] * scale
             xlim_min, xlim_max = self.axs[0].get_xlim()
             self.x_lim_min, self.x_lim_max = xlim_min * scale, xlim_max * scale
+            saved_at = datetime.now().astimezone().isoformat(timespec="seconds")
             params = {
                 "Cf": self.Cf.get(),
                 "y": self.y.get(),
@@ -598,6 +600,10 @@ class CZMFitterView(tk.Toplevel):
                 "x_max": vline_x2,
                 "x_lim_min": self.x_lim_min,
                 "x_lim_max": self.x_lim_max,
+                "manual_confirmed": True,
+                "manual_adjusted": bool(self.user_adjusted_lines),
+                "fit_source": "manual_gui_save",
+                "saved_at": saved_at,
             }
             self.event["czm_parms"] = params
             self.data_manager.set_data(
@@ -605,6 +611,8 @@ class CZMFitterView(tk.Toplevel):
                 params,
                 True,
             )
+            if self.data_manager.data_path is not None:
+                self.data_manager.save_file(self.data_manager.data_path)
             self.parent.refresh_tree()
             print(f"Saved parameters for event {self.event_idx}: {params}")
 
