@@ -26,6 +26,7 @@ AUTO_FIT_MIN_SAMPLES = 25
 AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2 = 1e6
 AUTO_FIT_PHYSICAL_BRANCH_RMSE_TOLERANCE = 1.15
 AUTO_FIT_MAX_EVALS = 250
+AUTO_FIT_GLOBAL_TOP_SEEDS = 8
 AUTO_FIT_YOUNGS_MODULUS_PA = 7.662e9
 AUTO_FIT_POISSON_RATIO = 0.2
 AUTO_FIT_DENSITY_KG_PER_M3 = 1148.0
@@ -650,6 +651,121 @@ class CZMFitterView(tk.Toplevel):
             self.filter_window.set(window_length)
         return signal.savgol_filter(signal_mpa, window_length, 2)
 
+    def _unique_clipped_values(self, values, lower, upper):
+        clipped = []
+        for value in values:
+            value = float(np.clip(value, lower, upper))
+            if np.isfinite(value):
+                clipped.append(value)
+        if not clipped:
+            return np.array([float(lower), float(upper)], dtype=np.float64)
+        clipped = np.array(sorted(set(round(value, 12) for value in clipped)), dtype=np.float64)
+        return clipped
+
+    def _build_manual_fit_candidate_grids(self, *, lower, upper, x0, line_positions):
+        current_cf_ratio, current_gamma, current_tau_c_mpa, current_t0_s = np.asarray(x0, dtype=np.float64)
+        auto_fit_for_gauge = None
+        selected_label = self.gauge_index_to_option.get(self.strain_gauge.get())
+        if (
+            self.auto_fit_result is not None
+            and selected_label in self.auto_fit_result.get("fit_map", {})
+        ):
+            auto_fit_for_gauge = self.auto_fit_result["fit_map"][selected_label]
+
+        cf_seeds = [current_cf_ratio]
+        gamma_seeds = [current_gamma]
+        tau_seeds = [current_tau_c_mpa]
+        t0_seeds = [current_t0_s, line_positions[1]]
+        if auto_fit_for_gauge is not None:
+            cf_seeds.append(float(self.auto_fit_result["fit_summary"]["cf_mps"] / self.C_s))
+            gamma_seeds.append(float(auto_fit_for_gauge["gamma_j_m2"]))
+            tau_seeds.append(float(auto_fit_for_gauge["tau_c_mpa"]))
+            t0_seeds.append(float(auto_fit_for_gauge["t0_s"]))
+
+        cf_multipliers = [0.5, 0.75, 1.0, 1.25, 1.5]
+        gamma_multipliers = [0.2, 0.5, 1.0, 2.0, 5.0]
+        tau_multipliers = [0.2, 0.5, 1.0, 2.0, 5.0]
+        cf_values = self._unique_clipped_values(
+            [seed * mult for seed in cf_seeds for mult in cf_multipliers] + [lower[0], upper[0]],
+            lower[0],
+            upper[0],
+        )
+        gamma_values = self._unique_clipped_values(
+            [seed * mult for seed in gamma_seeds for mult in gamma_multipliers] + [lower[1], upper[1]],
+            lower[1],
+            upper[1],
+        )
+        tau_values = self._unique_clipped_values(
+            [seed * mult for seed in tau_seeds for mult in tau_multipliers] + [lower[2], upper[2]],
+            lower[2],
+            upper[2],
+        )
+
+        t0_low = float(lower[3])
+        t0_high = float(upper[3])
+        t0_span = t0_high - t0_low
+        t0_values = self._unique_clipped_values(
+            t0_seeds + list(np.linspace(t0_low, t0_high, 7)) + [line_positions[1] - 0.2 * t0_span, line_positions[1] + 0.2 * t0_span],
+            t0_low,
+            t0_high,
+        )
+        return cf_values, gamma_values, tau_values, t0_values
+
+    def _run_manual_fit_global_search(self, *, x0, lower, upper, fit_problem, x_sign, tau_residual_mpa, line_positions):
+        cf_values, gamma_values, tau_values, t0_values = self._build_manual_fit_candidate_grids(
+            lower=lower,
+            upper=upper,
+            x0=x0,
+            line_positions=line_positions,
+        )
+        seed_scores = []
+        for cf_ratio in cf_values:
+            for gamma_j_m2 in gamma_values:
+                for tau_c_mpa in tau_values:
+                    for t0_s in t0_values:
+                        theta = np.array([cf_ratio, gamma_j_m2, tau_c_mpa, t0_s], dtype=np.float64)
+                        residual = _residuals_free_cf_fixed_tau_res(
+                            theta,
+                            fit_problem=fit_problem,
+                            x_sign=x_sign,
+                            cs_mps=self.C_s,
+                            cd_mps=self.C_d,
+                            tau_residual_mpa=tau_residual_mpa,
+                        )
+                        if not np.all(np.isfinite(residual)):
+                            continue
+                        score = float(np.mean(residual**2))
+                        seed_scores.append((score, theta))
+
+        if not seed_scores:
+            raise RuntimeError("Global grid search did not produce any valid CZM fit seeds.")
+
+        seed_scores.sort(key=lambda item: item[0])
+        best_result = None
+        top_count = min(AUTO_FIT_GLOBAL_TOP_SEEDS, len(seed_scores))
+        for _, seed in seed_scores[:top_count]:
+            result = optimize.least_squares(
+                _residuals_free_cf_fixed_tau_res,
+                seed,
+                bounds=(lower, upper),
+                kwargs={
+                    "fit_problem": fit_problem,
+                    "x_sign": x_sign,
+                    "cs_mps": self.C_s,
+                    "cd_mps": self.C_d,
+                    "tau_residual_mpa": tau_residual_mpa,
+                },
+                loss="soft_l1",
+                f_scale=0.2,
+                max_nfev=AUTO_FIT_MAX_EVALS,
+            )
+            if best_result is None or result.cost < best_result.cost:
+                best_result = result
+
+        if best_result is None:
+            raise RuntimeError("Global search refinement failed to converge on any valid CZM fit.")
+        return best_result
+
     def save_parameters(self):
         if len(self.vlines) >= 3:
             scale = 1e-3 if isinstance(self.event.get("pick_arrivals"), dict) else 1.0
@@ -1007,20 +1123,14 @@ class CZMFitterView(tk.Toplevel):
         if self.auto_fit_result is not None:
             x_sign = int(self.auto_fit_result["fit_summary"]["x_sign"])
 
-        result = optimize.least_squares(
-            _residuals_free_cf_fixed_tau_res,
-            x0,
-            bounds=(lower, upper),
-            kwargs={
-                "fit_problem": fit_problem,
-                "x_sign": x_sign,
-                "cs_mps": self.C_s,
-                "cd_mps": self.C_d,
-                "tau_residual_mpa": tau_residual_mpa,
-            },
-            loss="soft_l1",
-            f_scale=0.2,
-            max_nfev=AUTO_FIT_MAX_EVALS,
+        result = self._run_manual_fit_global_search(
+            x0=x0,
+            lower=lower,
+            upper=upper,
+            fit_problem=fit_problem,
+            x_sign=x_sign,
+            tau_residual_mpa=tau_residual_mpa,
+            line_positions=line_positions,
         )
 
         cf_ratio, gamma_j_m2, tau_c_mpa, t0_s = np.asarray(result.x, dtype=np.float64)
