@@ -21,7 +21,6 @@ AUTO_FIT_ONSET_SEARCH_WINDOW_S = AUTO_FIT_WINDOW_S
 AUTO_FIT_ONSET_THRESHOLD_FRACTION = 0.15
 AUTO_FIT_DISPLAY_THRESHOLD_FRACTION = 0.05
 AUTO_FIT_LEFT_BASELINE_WINDOW_S = 0.002
-AUTO_FIT_RESIDUAL_WINDOW_S = 0.005
 AUTO_FIT_MIN_SAMPLES = 25
 AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2 = 1e6
 AUTO_FIT_PHYSICAL_BRANCH_RMSE_TOLERANCE = 1.15
@@ -80,28 +79,6 @@ def _normalize_filter_window_length(window_length, signal_size):
     if window_length % 2 == 0:
         window_length -= 1
     return max(3, window_length)
-
-
-def _default_residual_interval_end_s(residual_start_s):
-    return min(AUTO_FIT_WINDOW_S[1], float(residual_start_s) + AUTO_FIT_RESIDUAL_WINDOW_S)
-
-
-def _estimate_tau_residual_from_interval(relative_time_s, signal_mpa, interval_start_s, interval_end_s):
-    time_s = np.asarray(relative_time_s, dtype=np.float64)
-    data_mpa = np.asarray(signal_mpa, dtype=np.float64)
-    if time_s.size == 0 or data_mpa.size == 0:
-        return 0.0
-
-    start_s = float(min(interval_start_s, interval_end_s))
-    end_s = float(max(interval_start_s, interval_end_s))
-    mask = (time_s >= start_s) & (time_s <= end_s)
-    if not np.any(mask):
-        idx0 = int(np.argmin(np.abs(time_s - start_s)))
-        idx1 = int(np.argmin(np.abs(time_s - end_s)))
-        lo, hi = sorted((idx0, idx1))
-        mask = np.zeros_like(time_s, dtype=bool)
-        mask[lo : hi + 1] = True
-    return float(np.mean(data_mpa[mask]))
 
 
 def _estimate_peak_time_s(relative_time_s, delta_tau_mpa):
@@ -298,7 +275,6 @@ def _model_delta_tau(theta, *, fit_problem, x_sign, cs_mps, cd_mps):
         return np.full_like(fit_problem["fit_data_mpa"], 1e6)
 
     cf_ratio, gamma_j_m2, tau_c_mpa, t0_s = theta[:4]
-    tau_residual_mpa = float(theta[4]) if theta.size >= 5 else 0.0
     if cf_ratio <= 0 or gamma_j_m2 <= 0 or tau_c_mpa <= 0 or cf_ratio >= 1.0:
         return np.full_like(fit_problem["fit_data_mpa"], 1e6)
 
@@ -328,7 +304,7 @@ def _model_delta_tau(theta, *, fit_problem, x_sign, cs_mps, cd_mps):
 
     left_count = max(1, min(5, model_tau_mpa.size))
     baseline_mean = float(np.mean(model_tau_mpa[:left_count]))
-    return model_tau_mpa - baseline_mean + tau_residual_mpa
+    return model_tau_mpa - baseline_mean
 
 
 def _residuals_fixed_cf(theta, *, fit_problem, cf_ratio, x_sign, cs_mps, cd_mps):
@@ -345,17 +321,6 @@ def _residuals_fixed_cf(theta, *, fit_problem, cf_ratio, x_sign, cs_mps, cd_mps)
 def _residuals_free_cf(theta, *, fit_problem, x_sign, cs_mps, cd_mps):
     return _model_delta_tau(
         theta,
-        fit_problem=fit_problem,
-        x_sign=x_sign,
-        cs_mps=cs_mps,
-        cd_mps=cd_mps,
-    ) - fit_problem["fit_data_mpa"]
-
-
-def _residuals_free_cf_fixed_tau_res(theta, *, fit_problem, x_sign, cs_mps, cd_mps, tau_residual_mpa):
-    local_theta = np.concatenate((np.asarray(theta, dtype=np.float64), [float(tau_residual_mpa)]))
-    return _model_delta_tau(
-        local_theta,
         fit_problem=fit_problem,
         x_sign=x_sign,
         cs_mps=cs_mps,
@@ -400,7 +365,6 @@ class CZMFitterView(tk.Toplevel):
         self.y = tk.DoubleVar()
         self.Xc = tk.DoubleVar()
         self.Gc = tk.DoubleVar()
-        self.tau_residual = tk.DoubleVar()
 
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -487,7 +451,6 @@ class CZMFitterView(tk.Toplevel):
             ("y", self.y, 1e-3),
             ("Xc", self.Xc, 1e-4),
             ("Gc", self.Gc, 1),
-            ("tau_res", self.tau_residual, 0.01),
         ]
         for label_text, var, increment in param_configs:
             frame = ttk.Frame(params_frame)
@@ -530,7 +493,7 @@ class CZMFitterView(tk.Toplevel):
         if "czm_parms" in self.event:
             params = self.event["czm_parms"]
             if isinstance(params, list) and len(params) == 8:
-                self._set_parameters(*params[:4], 0.0)
+                self._set_parameters(*params[:4])
                 vline_x0, vline_x1 = params[4], params[5]
                 vline_x2 = vline_x1 * 2 - vline_x0
                 self.x_lim_min, self.x_lim_max = params[6], params[7]
@@ -541,18 +504,14 @@ class CZMFitterView(tk.Toplevel):
                     params["y"],
                     params["Xc"],
                     params["Gc"],
-                    params.get("tau_residual_mpa", 0.0),
                 )
                 vline_x0, vline_x1, vline_x2 = params["x_min"], params["x_tip"], params["x_max"]
-                vline_x3 = params.get("x_res", _default_residual_interval_end_s(vline_x2))
                 self.x_lim_min, self.x_lim_max = params["x_lim_min"], params["x_lim_max"]
                 if "strain_gauge" in params and params["strain_gauge"] in self.available_gauge_indices:
                     self._set_selected_gauge(params["strain_gauge"])
                 else:
                     self._set_selected_gauge(self.available_gauge_indices[0])
-            if isinstance(params, list) and len(params) == 8:
-                vline_x3 = _default_residual_interval_end_s(vline_x2)
-            self._plot_vertical_lines([vline_x0, vline_x1, vline_x2, vline_x3])
+            self._plot_vertical_lines([vline_x0, vline_x1, vline_x2])
             self.event["czm_parms"] = {
                 "Cf": self.Cf.get(),
                 "y": self.y.get(),
@@ -562,7 +521,6 @@ class CZMFitterView(tk.Toplevel):
                 "x_min": vline_x0,
                 "x_tip": vline_x1,
                 "x_max": vline_x2,
-                "x_res": vline_x3,
                 "x_lim_min": self.x_lim_min,
                 "x_lim_max": self.x_lim_max,
             }
@@ -572,12 +530,11 @@ class CZMFitterView(tk.Toplevel):
 
         self.axs[0].set_xlim(self.x_lim_min, self.x_lim_max)
 
-    def _set_parameters(self, Cf, y, Xc, Gc, tau_residual_mpa=0.0):
+    def _set_parameters(self, Cf, y, Xc, Gc):
         self.Cf.set(Cf)
         self.y.set(y)
         self.Xc.set(Xc)
         self.Gc.set(Gc)
-        self.tau_residual.set(tau_residual_mpa)
 
     def _set_default_parameters(self):
         self.x_lim_min, self.x_lim_max = -0.1, 0.1
@@ -591,17 +548,17 @@ class CZMFitterView(tk.Toplevel):
         self.y.set(AUTO_FIT_DISTANCE_TO_FAULT_M)
         self.Xc.set(1)
         self.Gc.set(1)
-        self.tau_residual.set(0.0)
 
     def _plot_vertical_lines(self, positions):
         if not hasattr(self, "axs"):
             return
         display_scale = 1000.0 if isinstance(self.event.get("pick_arrivals"), dict) else 1.0
         for i, x_pos in enumerate(positions):
-            color = "r" if i == 1 else "g"
+            color = "tab:red" if i == 1 else ("tab:purple" if i == 0 else "tab:green")
+            linestyle = ":" if i == 0 else "--"
             x_display = x_pos * display_scale
-            vline = self.axs[0].axvline(x=x_display, color=color, linestyle="--", alpha=0.5)
-            vline_twin = self.axs[1].axvline(x=x_display, color=color, linestyle="--", alpha=0.5)
+            vline = self.axs[0].axvline(x=x_display, color=color, linestyle=linestyle, alpha=0.75)
+            vline_twin = self.axs[1].axvline(x=x_display, color=color, linestyle=linestyle, alpha=0.75)
             self.vlines.append(vline)
             self.vlines_twin.append(vline_twin)
 
@@ -711,7 +668,7 @@ class CZMFitterView(tk.Toplevel):
         )
         return cf_values, gamma_values, tau_values, t0_values
 
-    def _run_manual_fit_global_search(self, *, x0, lower, upper, fit_problem, x_sign, tau_residual_mpa, line_positions):
+    def _run_manual_fit_global_search(self, *, x0, lower, upper, fit_problem, x_sign, line_positions):
         cf_values, gamma_values, tau_values, t0_values = self._build_manual_fit_candidate_grids(
             lower=lower,
             upper=upper,
@@ -724,13 +681,12 @@ class CZMFitterView(tk.Toplevel):
                 for tau_c_mpa in tau_values:
                     for t0_s in t0_values:
                         theta = np.array([cf_ratio, gamma_j_m2, tau_c_mpa, t0_s], dtype=np.float64)
-                        residual = _residuals_free_cf_fixed_tau_res(
+                        residual = _residuals_free_cf(
                             theta,
                             fit_problem=fit_problem,
                             x_sign=x_sign,
                             cs_mps=self.C_s,
                             cd_mps=self.C_d,
-                            tau_residual_mpa=tau_residual_mpa,
                         )
                         if not np.all(np.isfinite(residual)):
                             continue
@@ -745,7 +701,7 @@ class CZMFitterView(tk.Toplevel):
         top_count = min(AUTO_FIT_GLOBAL_TOP_SEEDS, len(seed_scores))
         for _, seed in seed_scores[:top_count]:
             result = optimize.least_squares(
-                _residuals_free_cf_fixed_tau_res,
+                _residuals_free_cf,
                 seed,
                 bounds=(lower, upper),
                 kwargs={
@@ -753,7 +709,6 @@ class CZMFitterView(tk.Toplevel):
                     "x_sign": x_sign,
                     "cs_mps": self.C_s,
                     "cd_mps": self.C_d,
-                    "tau_residual_mpa": tau_residual_mpa,
                 },
                 loss="soft_l1",
                 f_scale=0.2,
@@ -772,11 +727,6 @@ class CZMFitterView(tk.Toplevel):
             vline_x0 = self.vlines[0].get_xdata()[0] * scale
             vline_x1 = self.vlines[1].get_xdata()[0] * scale
             vline_x2 = self.vlines[2].get_xdata()[0] * scale
-            vline_x3 = (
-                self.vlines[3].get_xdata()[0] * scale
-                if len(self.vlines) >= 4
-                else _default_residual_interval_end_s(vline_x2)
-            )
             xlim_min, xlim_max = self.axs[0].get_xlim()
             self.x_lim_min, self.x_lim_max = xlim_min * scale, xlim_max * scale
             saved_at = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -785,12 +735,10 @@ class CZMFitterView(tk.Toplevel):
                 "y": self.y.get(),
                 "Xc": self.Xc.get(),
                 "Gc": self.Gc.get(),
-                "tau_residual_mpa": self.tau_residual.get(),
                 "strain_gauge": self.strain_gauge.get(),
                 "x_min": vline_x0,
                 "x_tip": vline_x1,
                 "x_max": vline_x2,
-                "x_res": vline_x3,
                 "x_lim_min": self.x_lim_min,
                 "x_lim_max": self.x_lim_max,
                 "manual_confirmed": True,
@@ -827,16 +775,14 @@ class CZMFitterView(tk.Toplevel):
                 x_min = params[4]
                 x_tip = params[5]
                 x_max = params[5] * 2 - params[4]
-                line_positions = [x_min, x_tip, x_max, _default_residual_interval_end_s(x_max)]
+                line_positions = [x_min, x_tip, x_max]
             elif isinstance(params, dict):
                 x_min = params["x_min"]
                 x_tip = params["x_tip"]
                 x_max = params["x_max"]
-                x_res = params.get("x_res", _default_residual_interval_end_s(x_max))
-                line_positions = [x_min, x_tip, x_max, x_res]
+                line_positions = [x_min, x_tip, x_max]
         if not line_positions:
-            base_positions = np.linspace(self.x_lim_min, self.x_lim_max, 5)[1:-1]
-            line_positions = list(base_positions) + [_default_residual_interval_end_s(base_positions[-1])]
+            line_positions = np.linspace(self.x_lim_min, self.x_lim_max, 5)[1:-1]
 
         for ax in self.axs:
             ax.clear()
@@ -859,8 +805,6 @@ class CZMFitterView(tk.Toplevel):
             t_ms = t * 1000.0
             display_xlim = current_display_xlim if current_display_xlim is not None else AUTO_FIT_WINDOW_MS
             plot_line_positions = [position * 1000.0 for position in line_positions]
-            residual_tau_mpa = _estimate_tau_residual_from_interval(t, delta_tau, line_positions[2], line_positions[3])
-            self.tau_residual.set(residual_tau_mpa)
 
             fit_mask = (t >= line_positions[0]) & (t <= line_positions[2])
             fit_time = t[fit_mask]
@@ -916,7 +860,6 @@ class CZMFitterView(tk.Toplevel):
                         self.Gc.get(),
                         tau_c_mpa,
                         line_positions[1],
-                        residual_tau_mpa,
                     ],
                     dtype=np.float64,
                 )
@@ -970,8 +913,6 @@ class CZMFitterView(tk.Toplevel):
         fit_span_color = "tab:red"
         for ax in self.axs:
             ax.axvspan(plot_line_positions[0], plot_line_positions[2], color=fit_span_color, alpha=0.08, zorder=-120)
-            if len(plot_line_positions) >= 4:
-                ax.axvspan(plot_line_positions[2], plot_line_positions[3], color="tab:blue", alpha=0.05, zorder=-121)
             ax.axhline(0.0, color="black", linestyle="--", linewidth=0.8, alpha=0.8)
 
         self.axs[1].set_xlabel("Time relative to trigger (ms)")
@@ -985,8 +926,8 @@ class CZMFitterView(tk.Toplevel):
 
         self.vlines = []
         self.vlines_twin = []
-        line_colors = ["tab:purple", "tab:red", "tab:green", "tab:cyan"]
-        line_styles = [":", "--", "--", "--"]
+        line_colors = ["tab:purple", "tab:red", "tab:green"]
+        line_styles = [":", "--", "--"]
         for i, x_pos in enumerate(plot_line_positions):
             color = line_colors[i] if i < len(line_colors) else "g"
             linestyle = line_styles[i] if i < len(line_styles) else "--"
@@ -1060,20 +1001,12 @@ class CZMFitterView(tk.Toplevel):
             np.asarray(pick_arrivals["delta_tau_mpa_by_label"][selected_label], dtype=np.float64),
         )
         line_positions = [line.get_xdata()[0] * 1e-3 for line in self.vlines]
-        if len(line_positions) < 4:
-            line_positions.append(_default_residual_interval_end_s(line_positions[2]))
         fit_mask = (relative_time_s >= line_positions[0]) & (relative_time_s <= line_positions[2])
         fit_time_s = relative_time_s[fit_mask]
         fit_data_mpa = delta_tau_signal[fit_mask]
         if fit_time_s.size < AUTO_FIT_MIN_SAMPLES:
             print("Selected fit window is too small for manual CZM fitting.")
             return
-        tau_residual_mpa = _estimate_tau_residual_from_interval(
-            relative_time_s,
-            delta_tau_signal,
-            line_positions[2],
-            line_positions[3],
-        )
 
         baseline_mask = np.zeros_like(fit_time_s, dtype=bool)
         edge_count = min(5, fit_time_s.size)
@@ -1129,7 +1062,6 @@ class CZMFitterView(tk.Toplevel):
             upper=upper,
             fit_problem=fit_problem,
             x_sign=x_sign,
-            tau_residual_mpa=tau_residual_mpa,
             line_positions=line_positions,
         )
 
@@ -1139,7 +1071,6 @@ class CZMFitterView(tk.Toplevel):
         self.Cf.set(float(cf_ratio * self.C_s))
         self.Gc.set(float(gamma_j_m2))
         self.Xc.set(float(xc_m))
-        self.tau_residual.set(float(tau_residual_mpa))
         self.user_adjusted_lines = True
         self.vlines[1].set_xdata([t0_s * 1000.0, t0_s * 1000.0])
         self.vlines_twin[1].set_xdata([t0_s * 1000.0, t0_s * 1000.0])
@@ -1147,7 +1078,7 @@ class CZMFitterView(tk.Toplevel):
         print(
             f"Manual fit ({selected_label}): Cf={self.Cf.get():.1f} m/s, "
             f"Gc={self.Gc.get():.3e} J/m^2, Xc={self.Xc.get() * 1000.0:.2f} mm, "
-            f"t0={t0_s * 1000.0:.3f} ms, tau_res={self.tau_residual.get():.3f} MPa, success={bool(result.success)}"
+            f"t0={t0_s * 1000.0:.3f} ms, success={bool(result.success)}"
         )
 
     def _configure_available_gauges(self):
@@ -1202,7 +1133,6 @@ class CZMFitterView(tk.Toplevel):
         fit_result = self.auto_fit_result["fit_map"][selected_label]
         self.Xc.set(float(fit_result["xc_m"]))
         self.Gc.set(float(fit_result["gamma_j_m2"]))
-        self.tau_residual.set(float(fit_result.get("tau_residual_mpa", 0.0)))
         for line in self.vlines:
             line.remove()
         for line in self.vlines_twin:
@@ -1214,7 +1144,6 @@ class CZMFitterView(tk.Toplevel):
                 float(fit_result.get("display_start_s", fit_result["fit_start_s"])),
                 float(fit_result.get("model_peak_time_s", fit_result["t0_s"])),
                 float(fit_result.get("display_end_s", fit_result["fit_end_s"])),
-                float(fit_result.get("residual_end_s", _default_residual_interval_end_s(fit_result.get("display_end_s", fit_result["fit_end_s"])))),
             ]
         )
 
@@ -1271,14 +1200,13 @@ class CZMFitterView(tk.Toplevel):
                 delta_tau_signal = self._get_delta_tau_signal(relative_time_s, delta_tau_by_label[label])
                 fit_problem = _build_fit_problem(relative_time_s, delta_tau_signal, peak_map[label])
                 fit_problem["y_m"] = AUTO_FIT_DISTANCE_TO_FAULT_M
-                x0 = np.array([2_000.0, 5.0, float(peak_map[label]["peak_time_s"]), 0.0], dtype=np.float64)
-                lower = np.array([1e-3, 1e-3, float(fit_problem["fit_start_s"]), -5.0], dtype=np.float64)
+                x0 = np.array([2_000.0, 5.0, float(peak_map[label]["peak_time_s"])], dtype=np.float64)
+                lower = np.array([1e-3, 1e-3, float(fit_problem["fit_start_s"])], dtype=np.float64)
                 upper = np.array(
                     [
                         AUTO_FIT_GAMMA_UPPER_BOUND_J_PER_M2,
                         1_000.0,
                         float(fit_problem["fit_end_s"]),
-                        5.0,
                     ],
                     dtype=np.float64,
                 )
@@ -1298,9 +1226,9 @@ class CZMFitterView(tk.Toplevel):
                     max_nfev=AUTO_FIT_MAX_EVALS,
                 )
 
-                gamma_j_m2, tau_c_mpa, t0_s, tau_residual_mpa = np.asarray(result.x, dtype=np.float64)
+                gamma_j_m2, tau_c_mpa, t0_s = np.asarray(result.x, dtype=np.float64)
                 local_theta = np.array(
-                    [float(cf_mps / self.C_s), gamma_j_m2, tau_c_mpa, t0_s, tau_residual_mpa],
+                    [float(cf_mps / self.C_s), gamma_j_m2, tau_c_mpa, t0_s],
                     dtype=np.float64,
                 )
                 fit_model_mpa = _model_delta_tau(
@@ -1326,7 +1254,6 @@ class CZMFitterView(tk.Toplevel):
                     "xc_m": float(xc_m),
                     "xc_mm": float(xc_m * 1000.0),
                     "t0_s": float(t0_s),
-                    "tau_residual_mpa": float(tau_residual_mpa),
                     "rmse_mpa": rmse_mpa,
                     "fit_model_mpa": fit_model_mpa,
                     "fit_data_mpa": fit_data_mpa,
@@ -1345,7 +1272,6 @@ class CZMFitterView(tk.Toplevel):
                 )
                 if display_positions is not None:
                     fit_map[label].update(display_positions)
-                    fit_map[label]["residual_end_s"] = _default_residual_interval_end_s(display_positions["display_end_s"])
 
             fit_summary = {
                 "cf_mps": float(cf_mps),
